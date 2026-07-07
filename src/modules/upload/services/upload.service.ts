@@ -1,0 +1,287 @@
+import { Inject, Injectable, BadRequestException } from '@nestjs/common';
+import {
+    S3Client,
+    PutObjectCommand,
+    DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { v4 as uuid } from 'uuid';
+import { R2_CLIENT } from '../providers/r2-client.provider';
+import { UploadValidator } from '../validators/upload.validator';
+import { UploadStatus } from '../enums/upload-status.enum';
+import { CreatePresignedUploadDto } from '../dtos/create-presigned-url.dto';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, LessThan, In, EntityManager } from 'typeorm';
+import { Upload } from '../entities/upload.entity';
+
+
+
+// #TODO implmentar deleção auto de uploas expireds and resolve a pontencial bug when the same file is used in diferente contexts(i.e. folders)
+@Injectable()
+export class UploadService {
+    constructor(
+        @InjectRepository(Upload)
+        private readonly uploadRepo: Repository<Upload>,
+        @Inject(R2_CLIENT) private readonly s3: S3Client,
+        private readonly uploadValidator: UploadValidator,
+    ) { }
+
+    private async generatePresignedUpload(
+        userId: number | null,
+        dto: CreatePresignedUploadDto,
+    ) {
+        const { folder, fileType, fileHash, size } = dto;
+
+        this.uploadValidator.validateUploadData(
+            folder,
+            fileType,
+            size
+        );
+
+        const existing = await this.uploadRepo.findOne({
+            where: {
+                userId,
+                fileHash,
+                status: UploadStatus.TEMPORARY,
+            },
+        });
+
+        if (existing && existing.expiresAt > new Date()) {
+            return {
+                alreadyUploaded: true,
+                fileUrl: existing.url,
+                key: existing.key,
+            };
+        }
+
+        const key = `${folder}/${uuid()}`;
+
+        const command = new PutObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key,
+            ContentType: fileType,
+        });
+
+        const uploadUrl = await getSignedUrl(
+            this.s3,
+            command,
+            {
+                expiresIn: 60 * 10,
+            },
+        );
+
+        const fileUrl = `${process.env.R2_PUBLIC_URL}/${key}`;
+
+        const expiresAt = new Date();
+        expiresAt.setHours(expiresAt.getHours() + 24);
+
+        const upload = this.uploadRepo.create({
+            userId,
+            fileHash,
+            key,
+            url: fileUrl,
+            mimeType: fileType,
+            folder,
+            size,
+            status: UploadStatus.TEMPORARY,
+            expiresAt,
+        });
+
+        await this.uploadRepo.save(upload);
+
+        console.log({
+            msg: 'Presigned upload created',
+            action: 'UPLOAD_CREATED',
+            service: 'Upload',
+            data: {
+                userId,
+                folder,
+                key,
+                isPublic: userId === null,
+            },
+        });
+
+        return {
+            alreadyUploaded: false,
+            url: uploadUrl,
+            key,
+            fileUrl,
+        };
+    }
+
+    async createPresignedUpload(
+        userId: number,
+        dto: CreatePresignedUploadDto,
+    ) {
+        return this.generatePresignedUpload(
+            userId,
+            dto,
+        );
+    }
+
+
+    async createPublicPresignedUpload(
+        dto: CreatePresignedUploadDto,
+    ) {
+        this.uploadValidator.validatePublicUploadFolder(
+            dto.folder,
+        );
+
+        return this.generatePresignedUpload(
+            null,
+            dto,
+        );
+    }
+
+
+    async deleteFileFromUrl(url: string) {
+        const key = this.extractKeyFromUrl(url);
+
+        if (!key) return;
+
+        await this.s3.send(
+            new DeleteObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: key,
+            }),
+        );
+
+        await this.uploadRepo.update(
+            { key },
+            {
+                status: UploadStatus.DELETED,
+                deletedAt: new Date(),
+            },
+        );
+
+        console.log({
+            msg: 'File deleted from R2',
+            action: 'UPLOAD_DELETED',
+            service: 'Upload',
+            data: { key },
+        });
+    }
+
+    async findExpiredTemporaryUploads() {
+        return this.uploadRepo.find({
+            where: {
+                status: UploadStatus.TEMPORARY,
+                expiresAt: LessThan(new Date()),
+            },
+        });
+    }
+
+    private extractKeyFromUrl(url: string): string {
+        const baseUrl = process.env.R2_PUBLIC_URL?.replace(/\/$/, '');
+
+        if (!baseUrl) return '';
+
+        return url.replace(baseUrl + '/', '');
+    }
+
+    async validateTemporaryUpload(
+        key: string,
+        userId: number,
+    ) {
+        const upload = await this.uploadRepo.findOne({
+            where: {
+                key,
+                userId,
+            },
+        });
+
+        if (!upload) {
+            throw new BadRequestException('Upload not found');
+        }
+
+        if (upload.status !== UploadStatus.TEMPORARY) {
+            throw new BadRequestException('Upload already used');
+        }
+
+        if (upload.expiresAt < new Date()) {
+            throw new BadRequestException('Upload expired');
+        }
+
+        return upload;
+    }
+
+    async assignUploadsToUser(fileUrls: string[], userId: number, manager?: EntityManager): Promise<void> {
+        const keys = fileUrls.map((url) => this.extractKeyFromUrl(url));
+        const uploadRepo = manager ? manager.getRepository(Upload) : this.uploadRepo;
+
+        const result = await uploadRepo.update(
+            {
+                key: In(keys),
+                status: UploadStatus.TEMPORARY
+            },
+            {
+                userId
+            }
+        );
+    }
+
+    async markAsUsed(fileUrls: string[], userId: number, manager?: EntityManager) {
+        const keys = fileUrls.map((url) => this.extractKeyFromUrl(url));
+        const uploadRepo = manager ? manager.getRepository(Upload) : this.uploadRepo;
+
+        const uploads = await uploadRepo.find({
+            where: {
+                key: In(keys)
+            }
+        });
+
+        if (uploads.length !== keys.length) {
+            throw new BadRequestException('Alguns arquivos não foram encontrados ou já foram processados');
+        }
+
+        for (const upload of uploads) {
+            if (upload.userId !== userId && upload.userId !== null) {
+                throw new BadRequestException('Você não tem permissão para usar este arquivo');
+            }
+
+            if (upload.expiresAt < new Date()) {
+                throw new BadRequestException('O upload do arquivo expirou');
+            }
+
+            upload.status = UploadStatus.USED;
+            upload.usedAt = new Date();
+            upload.userId = userId;
+        }
+
+        await uploadRepo.save(uploads);
+
+        console.log({
+            msg: 'Uploads marked as USED',
+            action: 'UPLOAD_USED',
+            service: 'Upload',
+            data: { userId, keys },
+        });
+
+        return uploads;
+    }
+
+    async markAsDeleted(fileUrls: string[]) {
+        const keys = fileUrls.map((url) =>
+            this.extractKeyFromUrl(url),
+        );
+
+        await this.uploadRepo.update(
+            {
+                key: In(keys),
+            },
+            {
+                status: UploadStatus.DELETED,
+                deletedAt: new Date(),
+            },
+        );
+
+        console.log({
+            msg: 'Uploads marked as DELETED',
+            action: 'UPLOAD_DELETED',
+            service: 'Upload',
+            data: {
+                keys,
+            },
+        });
+    }
+}
